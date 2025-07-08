@@ -297,6 +297,8 @@ class DataScan : public MDSUtility, public MetadataTool
     bool force_init;
     // Only scan inodes without this scrub tag
     std::string filter_tag;
+    // Show progress output
+    bool show_progress;
 
     /**
      * @param r set to error on valid key with invalid value
@@ -324,7 +326,8 @@ class DataScan : public MDSUtility, public MetadataTool
     int forall_objects(
         librados::IoCtx &ioctx,
         bool untagged_only,
-        std::function<int(std::string, uint64_t, uint64_t)> handler);
+        std::function<int(std::string, uint64_t, uint64_t)> handler,
+        const std::string& operation_name);
 
   public:
     static void usage();
@@ -334,7 +337,7 @@ class DataScan : public MDSUtility, public MetadataTool
       : driver(NULL), fscid(FS_CLUSTER_ID_NONE),
 	data_pool_id(-1), n(0), m(1),
         force_pool(false), force_corrupt(false),
-        force_init(false)
+        force_init(false), show_progress(false)
     {
     }
 
