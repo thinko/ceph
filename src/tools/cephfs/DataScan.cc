@@ -51,6 +51,7 @@ void DataScan::usage()
     << "    --force-corrupt: overrite apparently corrupt structures\n"
     << "    --force-init: write root inodes even if they exist\n"
     << "    --force-pool: use data pool even if it is not in FSMap\n"
+    << "    --progress: show progress output during scan operations\n"
     << "    --worker_m: Maximum number of workers\n"
     << "    --worker_n: Worker number, range 0-(worker_m-1)\n"
     << "\n"
@@ -134,6 +135,9 @@ bool DataScan::parse_arg(
     return true;
   } else if (arg == "--force-init") {
     force_init = true;
+    return true;
+  } else if (arg == "--progress") {
+    this->show_progress = true;
     return true;
   } else {
     return false;
@@ -575,6 +579,14 @@ int DataScan::scan_extents()
   }
 
   for (auto ioctx : data_ios) {
+    std::string pool_name_str;
+    int rlookup = librados::Rados(*ioctx).pool_reverse_lookup(ioctx->get_id(), &pool_name_str);
+    if (rlookup < 0) {
+      // Fallback if reverse lookup fails, though unlikely for an open IoCtx
+      pool_name_str = "pool_id_" + std::to_string(ioctx->get_id());
+    }
+    std::string op_name = "Scanning extents for pool '" + pool_name_str + "'";
+
     int r = forall_objects(*ioctx, false, [this, ioctx](
         std::string const &oid,
         uint64_t obj_name_ino,
@@ -619,7 +631,7 @@ int DataScan::scan_extents()
       }
 
       return r;
-    });
+    }, op_name);
     if (r < 0) {
       return r;
     }
@@ -643,12 +655,36 @@ int DataScan::probe_filter(librados::IoCtx &ioctx)
   return r >= 0;
 }
 
+#include "common/Timer.h"
+#include "common/safe_io.h"
+#include <iomanip> // For std::setprecision
+
+// Helper function to format ceph::timespan
+std::string format_timespan(ceph::timespan ts) {
+  std::stringstream ss;
+  auto secs = std::chrono::duration_cast<std::chrono::seconds>(ts);
+  auto total_seconds = secs.count();
+  long hours = total_seconds / 3600;
+  long minutes = (total_seconds % 3600) / 60;
+  long seconds = total_seconds % 60;
+  ss << std::setfill('0') << std::setw(2) << hours << ":"
+     << std::setfill('0') << std::setw(2) << minutes << ":"
+     << std::setfill('0') << std::setw(2) << seconds;
+  return ss.str();
+}
+
 int DataScan::forall_objects(
     librados::IoCtx &ioctx,
     bool untagged_only,
-    std::function<int(std::string, uint64_t, uint64_t)> handler
+    std::function<int(std::string, uint64_t, uint64_t)> handler,
+    const std::string& operation_name
     )
 {
+  auto start_time = ceph_clock_now();
+  auto last_report_time = start_time;
+  uint64_t processed_objects_count = 0;
+  const double report_interval_seconds = 5.0;
+
   librados::ObjectCursor range_i;
   librados::ObjectCursor range_end;
   ioctx.object_list_slice(
@@ -731,8 +767,41 @@ int DataScan::forall_objects(
         r = this_oid_r;
       }
     }
+
+    processed_objects_count += result.size();
+    auto current_time = ceph_clock_now();
+    ceph::timespan time_since_last_report = current_time - last_report_time;
+
+    if (this->show_progress && n == 0 && (time_since_last_report.count() >= report_interval_seconds || range_i >= range_end)) {
+      ceph::timespan elapsed_time = current_time - start_time;
+      double rate = 0.0;
+      if (elapsed_time.count() > 0) {
+        rate = static_cast<double>(processed_objects_count) / elapsed_time.count();
+      }
+      std::cerr << ceph_clock_now() << " INF datascan.forall_objects: Worker " << n << "/" << m
+                << " (" << operation_name << "): Processed " << processed_objects_count
+                << " objects in " << format_timespan(elapsed_time)
+                << " (" << std::fixed << std::setprecision(2) << rate << " obj/s)"
+                << (range_i >= range_end ? " - Final" : "") << std::endl;
+      last_report_time = current_time;
+    }
   }
 
+  // Ensure final report if not already printed due to loop condition
+  if (this->show_progress && n == 0 && range_i >= range_end) {
+    auto current_time = ceph_clock_now();
+    ceph::timespan elapsed_time = current_time - start_time;
+    if (elapsed_time > (last_report_time - start_time)) { // Avoid re-printing if already done by loop condition
+      double rate = 0.0;
+      if (elapsed_time.count() > 0) {
+        rate = static_cast<double>(processed_objects_count) / elapsed_time.count();
+      }
+      std::cerr << ceph_clock_now() << " INF datascan.forall_objects: Worker " << n << "/" << m
+                << " (" << operation_name << "): Processed " << processed_objects_count
+                << " objects in " << format_timespan(elapsed_time)
+                << " (" << std::fixed << std::setprecision(2) << rate << " obj/s) - Final" << std::endl;
+    }
+  }
   return r;
 }
 
@@ -751,6 +820,13 @@ int DataScan::scan_inodes()
       "one node before running 'scan_inodes'" << std::endl;
     return -EIO;
   }
+
+  std::string pool_name_str;
+  int rlookup = librados::Rados(data_io).pool_reverse_lookup(data_io.get_id(), &pool_name_str);
+  if (rlookup < 0) {
+    pool_name_str = "pool_id_" + std::to_string(data_io.get_id());
+  }
+  std::string op_name = "Scanning inodes for pool '" + pool_name_str + "'";
 
   return forall_objects(data_io, true, [this](
         std::string const &oid,
@@ -1010,7 +1086,7 @@ int DataScan::scan_inodes()
     }
 
     return r;
-  });
+  }, op_name);
 }
 
 int DataScan::cleanup()
