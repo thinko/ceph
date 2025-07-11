@@ -1,2 +1,0 @@
-{usr/,}lib/systemd/system/ceph-exporter*
-usr/bin/ceph-exporter
